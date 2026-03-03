@@ -1,30 +1,30 @@
 """
 MCP Server for the BibTeX Extractor.
 
-Exposes PDFEngine and LLMController functionality as MCP tools,
-communicating over stdio (JSON-RPC). The GUI client launches this
-as a subprocess and calls tools through the MCP protocol.
+Exposes PDFEngine functionality as MCP tools, communicating over stdio
+(JSON-RPC). The agent (agent.py) and GUI call these tools through
+the MCP protocol via MCPClient.
+
+This server provides only PDF operations — all LLM reasoning is handled
+by the agent loop, which decides which tools to call via function calling.
 
 Run standalone for testing:
     python mcp_server.py            # stdio mode (for MCP clients)
     mcp dev mcp_server.py           # interactive inspector UI
 
 Architecture:
-    bib_app_mcp.py ──MCP client──> [stdio] ──> THIS SERVER ──> PDFEngine
-                                                            ──> LLMController
+    bib_app_mcp.py ──┬── direct calls (rendering) ──> MCPClient ──> [stdio] ──> THIS SERVER
+                     └── BibAgent (reasoning)     ──┘
 """
 
 import sys
 import json
 import base64
-import io
 import logging
 
 from mcp.server.fastmcp import FastMCP
 
 from pdf_engine import PDFEngine
-from llm_controller import LLMController
-from llm_helper import LLMHelper
 
 # ── Logging to stderr (stdout is reserved for MCP JSON-RPC messages) ──
 logging.basicConfig(stream=sys.stderr, level=logging.DEBUG,
@@ -33,56 +33,9 @@ log = logging.getLogger(__name__)
 
 # ── Server-side state (persists across tool calls within one session) ──
 pdf_engine = PDFEngine()
-llm_controller: LLMController | None = None
 
 # ── FastMCP server instance ──
 mcp = FastMCP("BibExtractor")
-
-
-# ═══════════════════════════════════════════════════════════════════════
-#  LLM Connection Tools
-# ═══════════════════════════════════════════════════════════════════════
-
-@mcp.tool()
-def validate_connection(api_key: str) -> str:
-    """
-    Validate an LLM API key and initialize the LLM controller.
-    Returns JSON: {success, message, provider, model, available_models}
-    """
-    global llm_controller
-    log.info("validate_connection called")
-
-    try:
-        ctrl = LLMController(api_key=api_key)
-        success, msg = ctrl.llm.validate_connection()
-
-        if success:
-            llm_controller = ctrl
-            provider = getattr(ctrl.llm, "provider", "gemini")
-            model = getattr(ctrl.llm, "model_name", None) or "gemini-1.5-flash"
-            available = LLMHelper.AVAILABLE_MODELS.get(provider, [model])
-            return json.dumps({
-                "success": True,
-                "message": msg,
-                "provider": provider,
-                "model": model,
-                "available_models": available,
-            })
-        else:
-            return json.dumps({"success": False, "message": msg})
-
-    except Exception as e:
-        return json.dumps({"success": False, "message": str(e)})
-
-
-@mcp.tool()
-def set_model(model_name: str) -> str:
-    """Switch the active LLM model (e.g. 'gpt-4o', 'gemini-1.5-pro')."""
-    if llm_controller is None:
-        return "Error: Not connected. Call validate_connection first."
-    llm_controller.llm.set_model(model_name)
-    log.info(f"Model switched to {model_name}")
-    return f"Model switched to {model_name}"
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -141,53 +94,6 @@ def get_full_text() -> str:
 def get_text_range(start_page: int, end_page: int) -> str:
     """Return text for a specific 1-based inclusive page range."""
     return pdf_engine.get_context_text_range(start_page, end_page)
-
-
-# ═══════════════════════════════════════════════════════════════════════
-#  LLM Analysis Tools
-# ═══════════════════════════════════════════════════════════════════════
-
-@mcp.tool()
-def resolve_bibliography_range(full_text: str) -> str:
-    """
-    Use the LLM to identify the bibliography page range in the PDF.
-    Returns JSON: {start_page, end_page, reason} or "null".
-    """
-    if llm_controller is None:
-        return json.dumps({"error": "Not connected"})
-
-    result = llm_controller.resolve_bibliography_range(full_text)
-    if result is None:
-        return "null"
-    return json.dumps(result)
-
-
-@mcp.tool()
-def detect_citation_style(first_pages_text: str) -> str:
-    """
-    Analyze the first few pages to identify the citation style
-    (e.g. "Numeric Brackets", "Author-Year", "Superscript").
-    """
-    if llm_controller is None:
-        return "Error: Not connected"
-    return llm_controller.detect_citation_style(first_pages_text)
-
-
-@mcp.tool()
-def resolve_citation(selection_text: str, context_text: str,
-                     style_hint: str = "") -> str:
-    """
-    Resolve a user-selected citation snippet into BibTeX entries.
-    - selection_text: the text the user highlighted (e.g. "[1-3]")
-    - context_text: the bibliography section text
-    - style_hint: detected citation style (optional)
-    """
-    if llm_controller is None:
-        return "% Error: Not connected to LLM."
-    return llm_controller.resolve_citation(
-        selection_text, context_text,
-        style_hint=style_hint if style_hint else None
-    )
 
 
 # ═══════════════════════════════════════════════════════════════════════

@@ -135,6 +135,16 @@ class MCPClient:
         )
         return future.result(timeout=10)
 
+    def list_tools_with_schemas(self) -> list[dict]:
+        """Return full tool schemas: [{name, description, inputSchema}, ...]"""
+        if not self._connected or not self._loop or not self._session:
+            raise RuntimeError("Not connected.")
+
+        future = asyncio.run_coroutine_threadsafe(
+            self._async_list_tools_full(), self._loop
+        )
+        return future.result(timeout=10)
+
     @property
     def is_connected(self) -> bool:
         return self._connected
@@ -159,6 +169,18 @@ class MCPClient:
         """Async implementation of list_tools."""
         result = await self._session.list_tools()
         return [tool.name for tool in result.tools]
+
+    async def _async_list_tools_full(self) -> list[dict]:
+        """Async implementation of list_tools_with_schemas."""
+        result = await self._session.list_tools()
+        return [
+            {
+                "name": tool.name,
+                "description": tool.description or "",
+                "inputSchema": tool.inputSchema,
+            }
+            for tool in result.tools
+        ]
 
     # ── Background thread entry point ─────────────────────────────────
 

@@ -1,15 +1,15 @@
 """
-PDF Bib Extractor — MCP Edition.
-
-Functionally identical to bib_app.py, but all PDF and LLM operations
-go through the MCP protocol instead of direct in-process calls.
+PDF Bib Extractor — MCP + Agent Edition.
 
 Architecture:
     This GUI ──MCPClient──> [stdio pipe] ──> mcp_server.py ──> PDFEngine
-                                                            ──> LLMController
+              ──BibAgent──> LLM API (function calling)
+                         ──> MCPClient (tool execution)
 
-The MCPClient (mcp_client.py) manages the server subprocess and provides
-synchronous call_tool() wrappers for the async MCP protocol.
+The MCP server provides simple PDF tools (text extraction, rendering).
+The BibAgent uses LLM function calling to orchestrate intelligent
+operations (find bibliography, resolve citations). The LLM decides
+which PDF tools to call.
 """
 
 import tkinter as tk
@@ -23,12 +23,14 @@ import base64
 import io
 
 from mcp_client import MCPClient
+from llm_helper import LLMHelper
+from agent import BibAgent
 
 
 class BibApp:
     def __init__(self, root):
         self.root = root
-        self.root.title("PDF Bib Extractor (MCP Edition)")
+        self.root.title("PDF Bib Extractor (MCP + Agent)")
         self.root.geometry("1400x900")
 
         # --- Visual Style & Theme ---
@@ -67,15 +69,13 @@ class BibApp:
         self.style.configure("TLabelframe.Label", background=self.colors["bg_panel"], foreground=self.colors["accent"], font=("Helvetica", 10, "bold"))
         self.style.configure("TEntry", fieldbackground=self.colors["entry_bg"], foreground=self.colors["fg_text"], insertcolor="white", borderwidth=0)
 
-        # ── MCP Client (replaces direct PDFEngine + LLMController) ──
+        # ── MCP Client (PDF tool server) ──
         self.mcp_client = MCPClient()
-        self._mcp_connected = False  # True after server subprocess is up
+        self._mcp_connected = False
 
-        # We still need a local PDFEngine for rendering pages in the canvas,
-        # because shipping raw pixmap bytes over MCP for every scroll/resize
-        # would be too slow. The server handles LLM + text extraction.
-        # However, to stay true to the MCP demo, we route page rendering
-        # through MCP too — the base64 overhead is acceptable for a demo.
+        # ── LLM + Agent (created after API key validation) ──
+        self.llm: LLMHelper | None = None
+        self.agent: BibAgent | None = None
 
         self.current_context = ""
         self.current_page = 0
@@ -106,10 +106,21 @@ class BibApp:
                 self._mcp_connected = True
                 tools = self.mcp_client.list_tools()
                 self.update_status(f"MCP Server ready. Tools: {len(tools)}")
+                self._maybe_create_agent()
             except Exception as e:
                 self.update_status(f"MCP Server failed: {e}")
 
         threading.Thread(target=start, daemon=True).start()
+
+    def _maybe_create_agent(self):
+        """Create the agent if both LLM and MCP are ready."""
+        if self.llm and self._mcp_connected and self.agent is None:
+            self.agent = BibAgent(
+                llm=self.llm,
+                mcp_client=self.mcp_client,
+                on_status=self.update_status,
+            )
+            self.update_status("Agent ready.")
 
     def load_config(self):
         if os.path.exists(self.config_file):
@@ -213,17 +224,13 @@ class BibApp:
         self.enter_btn.pack(side=tk.LEFT)
 
     # ═══════════════════════════════════════════════════════════════════
-    #  API Key Validation — via MCP tool "validate_connection"
+    #  API Key Validation — local (no MCP needed)
     # ═══════════════════════════════════════════════════════════════════
 
     def check_api_key(self):
         key = self.api_key_var.get().strip()
         if not key:
             messagebox.showerror("Error", "Please enter an API Key.")
-            return
-
-        if not self._mcp_connected:
-            messagebox.showerror("Error", "MCP Server not ready yet. Please wait.")
             return
 
         self.key_status_label.config(text="Verifying...", foreground=self.colors["accent"])
@@ -234,12 +241,11 @@ class BibApp:
 
             def target():
                 try:
-                    # ── MCP TOOL CALL ──
-                    raw = self.mcp_client.call_tool(
-                        "validate_connection", {"api_key": key}
-                    )
-                    data = json.loads(raw)
-                    result['data'] = data
+                    helper = LLMHelper(api_key=key)
+                    success, msg = helper.validate_connection()
+                    result['success'] = success
+                    result['message'] = msg
+                    result['helper'] = helper
                 except Exception as e:
                     result['error'] = str(e)
 
@@ -253,14 +259,12 @@ class BibApp:
 
             if 'error' in result:
                 self.root.after(0, lambda: self._on_key_error(result['error']))
-            elif 'data' in result:
-                data = result['data']
-                if data.get("success"):
-                    self.root.after(0, lambda: self._on_key_success(data))
-                else:
-                    self.root.after(0, lambda: self._on_key_error(data.get("message", "Unknown error")))
+            elif result.get('success'):
+                helper = result['helper']
+                self.root.after(0, lambda: self._on_key_success(helper))
             else:
-                self.root.after(0, lambda: self._on_key_error("Unknown Error"))
+                msg = result.get('message', 'Unknown error')
+                self.root.after(0, lambda: self._on_key_error(msg))
 
         threading.Thread(target=verify_wrapper, daemon=True).start()
 
@@ -269,10 +273,11 @@ class BibApp:
         self.key_status_label.config(text=f"Error: {short_msg}", foreground=self.colors["error"])
         print(f"Key Error: {msg}")
 
-    def _on_key_success(self, data):
-        provider = data.get("provider", "gemini")
-        current_model = data.get("model", "gemini-1.5-flash")
-        models = data.get("available_models", [current_model])
+    def _on_key_success(self, helper: LLMHelper):
+        self.llm = helper
+        provider = helper.provider
+        current_model = helper.model_name
+        models = LLMHelper.AVAILABLE_MODELS.get(provider, [current_model])
 
         self.key_status_label.config(text=f"Connected ({provider})", foreground=self.colors["success"])
 
@@ -280,6 +285,9 @@ class BibApp:
 
         self.btn_open.config(state="normal")
         self.status_var.set(f"Ready. Using {current_model}.")
+
+        # Create agent if MCP is also ready
+        self._maybe_create_agent()
 
         # Switch to Active UI: [Label "Model:"] [Combobox] [Button "Change Key"]
         for widget in self.key_container.winfo_children():
@@ -297,25 +305,23 @@ class BibApp:
 
     def on_model_changed(self, event):
         new_model = self.model_combo.get()
-
-        def switch():
-            try:
-                # ── MCP TOOL CALL ──
-                self.mcp_client.call_tool("set_model", {"model_name": new_model})
-                self.update_status(f"Switched to {new_model}")
-            except Exception as e:
-                self.update_status(f"Model switch failed: {e}")
-
-        threading.Thread(target=switch, daemon=True).start()
+        if self.llm:
+            self.llm.set_model(new_model)
+            # Reset agent conversation for new model
+            if self.agent:
+                self.agent.reset()
+            self.update_status(f"Switched to {new_model}")
 
     def reset_api_ui(self):
+        self.llm = None
+        self.agent = None
         self.api_key_var.set("")
         self.btn_open.config(state="disabled")
         self.key_status_label.config(text="")
         self._build_key_input_state()
 
     # ═══════════════════════════════════════════════════════════════════
-    #  PDF Loading — via MCP tools
+    #  PDF Loading — MCP for load, Agent for analysis
     # ═══════════════════════════════════════════════════════════════════
 
     def open_pdf(self):
@@ -324,91 +330,81 @@ class BibApp:
             self.status_var.set(f"Loading {os.path.basename(path)}...")
             self.root.update()
             try:
-                # ── MCP TOOL CALL: load_pdf ──
+                # Direct MCP call to load the PDF
                 raw = self.mcp_client.call_tool("load_pdf", {"path": path})
                 data = json.loads(raw)
                 self._pdf_page_count = data.get("page_count", 0)
-                self._pdf_path = path  # remember for local rendering
+                self._pdf_path = path
 
                 self.current_page = 0
                 self.fit_to_page()
                 self.update_page_label()
-                self.status_var.set("PDF Loaded. Pre-loading context...")
+                self.status_var.set("PDF Loaded. Agent analyzing...")
 
-                # Fetch Context in Background
-                threading.Thread(target=self._fetch_context_thread, daemon=True).start()
+                # Reset agent conversation for new PDF
+                if self.agent:
+                    self.agent.reset()
+
+                # Agent analyzes the PDF in background
+                threading.Thread(target=self._agent_analyze_pdf, daemon=True).start()
 
             except Exception as e:
                 self.status_var.set(f"Error loading PDF: {e}")
 
-    def _fetch_context_thread(self):
+    def _agent_analyze_pdf(self):
+        """Use the agent to find bibliography and detect citation style."""
+        if not self.agent:
+            self.update_status("Agent not ready. Connect API key first.")
+            return
+
         try:
-            # ── MCP TOOL CALL: get_full_text ──
-            full_text = self.mcp_client.call_tool("get_full_text")
-            if not full_text:
-                self.update_status("Context Load Failed (Empty).")
-                return
-
-            self.update_status(f"Context Loaded ({len(full_text)} chars). Locating bibliography...")
-
-            # Default to full text (robust against LLM failures)
-            self.current_context = full_text
-
-            try:
-                # ── MCP TOOL CALL: resolve_bibliography_range ──
-                raw = self.mcp_client.call_tool(
-                    "resolve_bibliography_range", {"full_text": full_text}
-                )
-                if raw and raw != "null":
-                    range_info = json.loads(raw)
-                    if "error" not in range_info:
-                        start_page = range_info.get("start_page")
-                        end_page = range_info.get("end_page")
-                        if isinstance(start_page, int) and isinstance(end_page, int):
-                            # ── MCP TOOL CALL: get_text_range ──
-                            narrowed = self.mcp_client.call_tool(
-                                "get_text_range",
-                                {"start_page": start_page, "end_page": end_page}
-                            )
-                            if narrowed:
-                                self.current_context = narrowed
-                                self.update_status(f"Context narrowed to pages {start_page}-{end_page}. Ready.")
-            except Exception as e:
-                print(f"[WARN] Bibliography narrowing failed: {e}")
-                self.update_status("Bibliography Auto-Locate Failed (Using Full Text).")
-
-            # Detect citation style
-            self._detect_style_in_background()
-        except Exception as e:
-            print(f"Context error: {e}")
-            self.update_status("Context Load Failed (Check Console).")
-
-    def _detect_style_in_background(self):
-        try:
-            page_limit = min(5, self._pdf_page_count)
-            # ── MCP TOOL CALL: get_text_range ──
-            first_pages_text = self.mcp_client.call_tool(
-                "get_text_range", {"start_page": 1, "end_page": page_limit}
+            result = self.agent.run(
+                "Analyze this PDF. Find the bibliography section "
+                "and detect the citation style."
             )
 
-            if first_pages_text:
-                # ── MCP TOOL CALL: detect_citation_style ──
-                style = self.mcp_client.call_tool(
-                    "detect_citation_style", {"first_pages_text": first_pages_text}
-                )
-                self.citation_style_hint = style
-                print(f"[DEBUG] Detected Citation Style: {style}")
-                self.update_status(f"{self.status_var.get()} [Style: {style}]")
+            if result.error:
+                self.update_status(f"Analysis failed: {result.error}")
+                return
+
+            # Parse the agent's JSON response
+            try:
+                data = json.loads(result.text)
+                bib_text = data.get("bibliography_text", "")
+                style = data.get("citation_style")
+                bib_start = data.get("bibliography_start")
+                bib_end = data.get("bibliography_end")
+
+                if bib_text:
+                    self.current_context = bib_text
+                    self.citation_style_hint = style
+                    self.update_status(
+                        f"Bibliography: pages {bib_start}-{bib_end}. "
+                        f"Style: {style}. Ready. "
+                        f"({result.tool_calls_made} tool calls)"
+                    )
+                else:
+                    self.update_status("No bibliography found. Using full text.")
+                    full = self.mcp_client.call_tool("get_full_text")
+                    self.current_context = full
+
+            except json.JSONDecodeError:
+                # Agent returned non-JSON — use full text as fallback
+                print(f"[WARN] Agent returned non-JSON: {result.text[:200]}")
+                self.update_status("Analysis format unexpected. Using full text.")
+                full = self.mcp_client.call_tool("get_full_text")
+                self.current_context = full
+
         except Exception as e:
-            print(f"[WARN] Style detection failed: {e}")
+            print(f"Analysis error: {e}")
+            self.update_status(f"Analysis error: {e}")
 
     # ═══════════════════════════════════════════════════════════════════
-    #  Page Rendering — via MCP tool "get_page_pixmap"
+    #  Page Rendering — direct MCP (no agent needed)
     # ═══════════════════════════════════════════════════════════════════
 
     def render_page(self):
         try:
-            # ── MCP TOOL CALL: get_page_pixmap ──
             b64_png = self.mcp_client.call_tool(
                 "get_page_pixmap",
                 {"page_num": self.current_page, "zoom": self.zoom_level}
@@ -416,7 +412,6 @@ class BibApp:
             if not b64_png:
                 return
 
-            # Decode base64 PNG → PIL Image → ImageTk
             png_bytes = base64.b64decode(b64_png)
             img = Image.open(io.BytesIO(png_bytes))
             self.image_ref = ImageTk.PhotoImage(img)
@@ -453,15 +448,6 @@ class BibApp:
         canvas_h = self.canvas.winfo_height()
         if canvas_w > 10 and canvas_h > 10:
             try:
-                # We need the page dimensions to calculate zoom.
-                # For this, we do a quick render at zoom=1.0 to get dimensions,
-                # or we can use fitz locally just for geometry.
-                # To keep it pure-MCP, we'll request a pixmap at zoom=1.0
-                # and compute from the image size. But that's wasteful.
-                #
-                # Pragmatic compromise: use fitz locally ONLY for page rect,
-                # since geometry doesn't involve LLM or text extraction.
-                # This avoids a round-trip for every resize event.
                 import fitz as fitz_local
                 if not hasattr(self, '_local_doc') or self._local_doc is None:
                     if hasattr(self, '_pdf_path'):
@@ -480,7 +466,7 @@ class BibApp:
                 pass
 
     # ═══════════════════════════════════════════════════════════════════
-    #  Selection & Citation Resolution — via MCP tools
+    #  Selection & Citation Resolution — Agent-powered
     # ═══════════════════════════════════════════════════════════════════
 
     def on_canvas_click(self, event):
@@ -516,9 +502,9 @@ class BibApp:
             x1 = (max(start_x, x) - offset_x) / self.zoom_level
             y1 = (max(start_y, y) - offset_y) / self.zoom_level
 
-            # ── MCP TOOL CALL: get_text_in_rect ──
             def extract_and_resolve():
                 try:
+                    # Direct MCP call to extract text from selection
                     text = self.mcp_client.call_tool(
                         "get_text_in_rect",
                         {"page_num": self.current_page,
@@ -526,8 +512,8 @@ class BibApp:
                     )
                     if text and text.strip():
                         print(f"[DEBUG] User Selection: '{text}'")
-                        self.update_status("Resolving selection with LLM...")
-                        self._process_selection_mcp(text)
+                        self.update_status("Resolving selection with agent...")
+                        self._resolve_citation_with_agent(text)
                     else:
                         self.update_status("Empty selection.")
                 except Exception as e:
@@ -538,37 +524,47 @@ class BibApp:
         self.canvas.delete("selection_box")
         self.selection_start = None
 
-    def _process_selection_mcp(self, text):
-        """Resolve a citation selection via the MCP resolve_citation tool."""
+    def _resolve_citation_with_agent(self, text):
+        """Resolve a citation selection via the agent."""
+        if not self.agent:
+            self.append_to_output("% Error: Agent not ready.\n\n")
+            return
+
         try:
-            args = {
-                "selection_text": text,
-                "context_text": self.current_context,
-            }
-            if self.citation_style_hint:
-                args["style_hint"] = self.citation_style_hint
+            style_note = ""
+            if self.citation_style_hint and "Unknown" not in self.citation_style_hint:
+                style_note = f"\nThe document uses '{self.citation_style_hint}' citation style."
 
-            # ── MCP TOOL CALL: resolve_citation ──
-            result = self.mcp_client.call_tool("resolve_citation", args)
+            prompt = (
+                f"Resolve this citation selection into BibTeX entries.\n"
+                f"Selected text: \"{text}\"\n"
+                f"Bibliography context:\n\"\"\"\n{self.current_context}\n\"\"\""
+                f"{style_note}"
+            )
 
-            if result:
-                self.append_to_output(str(result) + "\n\n")
-                self.update_status("Resolution Complete.")
+            result = self.agent.run(prompt)
+
+            if result.text:
+                self.append_to_output(result.text + "\n\n")
+                self.update_status(
+                    f"Resolution complete. ({result.tool_calls_made} tool calls)"
+                )
             else:
                 self.append_to_output("% No result returned.\n\n")
-                self.update_status("Resolution Complete (Empty).")
+                self.update_status("Resolution complete (empty).")
+
         except Exception as e:
             err_str = str(e).lower()
             if "429" in err_str or "rate limit" in err_str or "quota" in err_str:
-                msg = "% [Error] LLM rate limit exceeded. Please wait a moment."
+                msg = "% [Error] LLM rate limit exceeded. Please wait."
             else:
                 msg = f"% [Error] {e}"
 
             self.append_to_output(msg + "\n\n")
-            self.update_status("Error: Rate Limit Exceeded" if "rate limit" in err_str or "429" in err_str else f"Error: {e}")
+            self.update_status(f"Error: {e}")
 
     # ═══════════════════════════════════════════════════════════════════
-    #  Output & Utilities (unchanged from original)
+    #  Output & Utilities
     # ═══════════════════════════════════════════════════════════════════
 
     def append_to_output(self, text):
