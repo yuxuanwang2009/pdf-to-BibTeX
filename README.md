@@ -9,7 +9,7 @@ An LLM-powered tool for extracting BibTeX citations from academic PDFs. Uses an 
 
 The app has two layers:
 
-- **MCP Server** — a simple PDF tool server (load, read text, render pages). No intelligence. Exposed via the [Model Context Protocol](https://modelcontextprotocol.io/) so any AI client can use it.
+- **PDF Engine** — a PyMuPDF wrapper that loads, renders, and extracts text from PDFs. Used directly by the GUI for rendering, and exposed as an MCP server for AI clients.
 - **Agent** — an LLM (OpenAI or Gemini) that receives your request, discovers the available PDF tools, and decides which to call. It finds the bibliography, detects the citation style, and resolves your selections to BibTeX.
 
 When you open a PDF, the agent reads the full text, locates the bibliography section, and identifies the citation style — all on its own. When you select text, the agent resolves the citation handles to BibTeX entries using the bibliography context it already has.
@@ -68,7 +68,7 @@ Restart Claude Desktop. Then in Chat:
 
 ### Option 3: Standalone (no MCP)
 
-The original direct-call GUI is still available:
+The original direct-call GUI is still available (in the `main` branch):
 
 ```bash
 python bib_app.py
@@ -78,23 +78,23 @@ python bib_app.py
 
 ```
 bib_app_mcp.py (GUI)
- ├── direct MCP calls (page rendering, navigation)
+ ├── PDFEngine (direct) ──> PyMuPDF   (rendering, page nav, text extraction)
  └── BibAgent (agent.py)
       ├── LLM API with function calling (the brain)
-      └── MCP tool execution (PDF operations)
-           │
-      mcp_server.py ──> pdf_engine.py ──> PyMuPDF
+      └── MCPClient ──> mcp_server.py ──> PDFEngine ──> PyMuPDF  (agent tools)
 ```
+
+The GUI uses `PDFEngine` directly for all rendering and text extraction — no serialization overhead. The MCP server is only involved when the agent needs to call PDF tools during LLM-driven analysis.
 
 | File | Role |
 |------|------|
+| `pdf_engine.py` | PyMuPDF wrapper (load, render, extract text) |
 | `mcp_server.py` | PDF tool server (MCP protocol, stdio transport) |
 | `mcp_client.py` | Sync wrapper for the async MCP client SDK |
 | `agent.py` | LLM agent loop with function calling + system prompt |
 | `llm_helper.py` | Provider abstraction (OpenAI / Gemini) with tool calling support |
-| `pdf_engine.py` | PyMuPDF wrapper (load, render, extract text) |
 | `bib_app_mcp.py` | Tkinter GUI (MCP + Agent edition) |
-| `bib_app.py` | Tkinter GUI (standalone, no MCP) |
+| `bib_app.py` | Tkinter GUI (standalone, no MCP — on `main` branch) |
 
 ## Troubleshooting
 

@@ -2,14 +2,12 @@
 PDF Bib Extractor — MCP + Agent Edition.
 
 Architecture:
-    This GUI ──MCPClient──> [stdio pipe] ──> mcp_server.py ──> PDFEngine
-              ──BibAgent──> LLM API (function calling)
-                         ──> MCPClient (tool execution)
+    This GUI ──PDFEngine (direct)──> PyMuPDF   (rendering, text extraction)
+             ──BibAgent──> LLM API (function calling)
+                        ──> MCPClient ──> mcp_server.py ──> PDFEngine  (agent tools)
 
-The MCP server provides simple PDF tools (text extraction, rendering).
-The BibAgent uses LLM function calling to orchestrate intelligent
-operations (find bibliography, resolve citations). The LLM decides
-which PDF tools to call.
+Rendering and text extraction use a local PDFEngine instance (no IPC).
+The MCP server is only used by the agent for LLM-driven tool calls.
 """
 
 import tkinter as tk
@@ -19,12 +17,12 @@ from PIL import Image, ImageTk
 import threading
 import os
 import json
-import base64
 import io
 
 from mcp_client import MCPClient
 from llm_helper import LLMHelper
 from agent import BibAgent
+from pdf_engine import PDFEngine
 
 
 class BibApp:
@@ -69,7 +67,10 @@ class BibApp:
         self.style.configure("TLabelframe.Label", background=self.colors["bg_panel"], foreground=self.colors["accent"], font=("Helvetica", 10, "bold"))
         self.style.configure("TEntry", fieldbackground=self.colors["entry_bg"], foreground=self.colors["fg_text"], insertcolor="white", borderwidth=0)
 
-        # ── MCP Client (PDF tool server) ──
+        # ── Local PDF engine (rendering, text extraction — no MCP overhead) ──
+        self.pdf_engine = PDFEngine()
+
+        # ── MCP Client (for agent tool execution only) ──
         self.mcp_client = MCPClient()
         self._mcp_connected = False
 
@@ -321,7 +322,7 @@ class BibApp:
         self._build_key_input_state()
 
     # ═══════════════════════════════════════════════════════════════════
-    #  PDF Loading — MCP for load, Agent for analysis
+    #  PDF Loading — local for rendering, MCP for agent
     # ═══════════════════════════════════════════════════════════════════
 
     def open_pdf(self):
@@ -330,11 +331,13 @@ class BibApp:
             self.status_var.set(f"Loading {os.path.basename(path)}...")
             self.root.update()
             try:
-                # Direct MCP call to load the PDF
-                raw = self.mcp_client.call_tool("load_pdf", {"path": path})
-                data = json.loads(raw)
-                self._pdf_page_count = data.get("page_count", 0)
+                # Load locally for rendering and text extraction
+                self.pdf_engine.load_pdf(path)
+                self._pdf_page_count = self.pdf_engine.get_page_count()
                 self._pdf_path = path
+
+                # Also load via MCP so the agent's tools work
+                self.mcp_client.call_tool("load_pdf", {"path": path})
 
                 self.current_page = 0
                 self.fit_to_page()
@@ -385,35 +388,29 @@ class BibApp:
                     )
                 else:
                     self.update_status("No bibliography found. Using full text.")
-                    full = self.mcp_client.call_tool("get_full_text")
-                    self.current_context = full
+                    self.current_context = self.pdf_engine.get_context_text()
 
             except json.JSONDecodeError:
                 # Agent returned non-JSON — use full text as fallback
                 print(f"[WARN] Agent returned non-JSON: {result.text[:200]}")
                 self.update_status("Analysis format unexpected. Using full text.")
-                full = self.mcp_client.call_tool("get_full_text")
-                self.current_context = full
+                self.current_context = self.pdf_engine.get_context_text()
 
         except Exception as e:
             print(f"Analysis error: {e}")
             self.update_status(f"Analysis error: {e}")
 
     # ═══════════════════════════════════════════════════════════════════
-    #  Page Rendering — direct MCP (no agent needed)
+    #  Page Rendering — direct PDFEngine (no MCP overhead)
     # ═══════════════════════════════════════════════════════════════════
 
     def render_page(self):
         try:
-            b64_png = self.mcp_client.call_tool(
-                "get_page_pixmap",
-                {"page_num": self.current_page, "zoom": self.zoom_level}
-            )
-            if not b64_png:
+            pix = self.pdf_engine.get_page_pixmap(self.current_page, self.zoom_level)
+            if pix is None:
                 return
 
-            png_bytes = base64.b64decode(b64_png)
-            img = Image.open(io.BytesIO(png_bytes))
+            img = Image.open(io.BytesIO(pix.tobytes("png")))
             self.image_ref = ImageTk.PhotoImage(img)
 
             self.canvas.delete("all")
@@ -448,14 +445,7 @@ class BibApp:
         canvas_h = self.canvas.winfo_height()
         if canvas_w > 10 and canvas_h > 10:
             try:
-                import fitz as fitz_local
-                if not hasattr(self, '_local_doc') or self._local_doc is None:
-                    if hasattr(self, '_pdf_path'):
-                        self._local_doc = fitz_local.open(self._pdf_path)
-                    else:
-                        return
-
-                page = self._local_doc[self.current_page]
+                page = self.pdf_engine.doc[self.current_page]
                 scale_w = (canvas_w - 20) / page.rect.width
                 scale_h = (canvas_h - 20) / page.rect.height
                 self.zoom_level = min(scale_w, scale_h)
@@ -504,12 +494,8 @@ class BibApp:
 
             def extract_and_resolve():
                 try:
-                    # Direct MCP call to extract text from selection
-                    text = self.mcp_client.call_tool(
-                        "get_text_in_rect",
-                        {"page_num": self.current_page,
-                         "x0": x0, "y0": y0, "x1": x1, "y1": y1}
-                    )
+                    rect = fitz.Rect(x0, y0, x1, y1)
+                    text = self.pdf_engine.get_text_in_rect(self.current_page, rect)
                     if text and text.strip():
                         print(f"[DEBUG] User Selection: '{text}'")
                         self.update_status("Resolving selection with agent...")
